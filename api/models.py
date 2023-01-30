@@ -1,9 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
-from django.utils.translation import ugettext_lazy as _
 
-from django import forms
-from django.core.validators import MaxValueValidator, MinValueValidator
 
 # null = False -> can't be created without this field
 # CASCADE -> delete element if one of these users disappear
@@ -62,6 +59,11 @@ class Contributor(models.Model):
                                    related_name='project_contributor')
     role = models.fields.CharField(max_length=128, null=False, choices=ROLES)
     permission = models.fields.CharField(max_length=40, null=False, choices=PERMISSIONS)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['user_id', 'project_id'], name="user_unique_in_project")
+        ]
 
     def __str__(self):
         return self.role

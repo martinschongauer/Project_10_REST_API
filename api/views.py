@@ -1,21 +1,16 @@
 
-# from api.permissions import IsAdminAuthenticated
-from rest_framework.decorators import authentication_classes, permission_classes
-
 from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.parsers import JSONParser
 
-# from rest_framework.authentication import SessionAuthentication, BasicAuthentication
-# from rest_framework.decorators import authentication_classes
-
 from rest_framework.decorators import permission_classes
 from rest_framework.permissions import IsAuthenticated
 
 from api.models import User, Project, Contributor, Issue, Comment
-from api.serializers import ProjectSerializer, CreateProjectSerializer, ProjectDetailSerializer
-from api.serializers import ContributorSerializer, IssueSerializer
+from api.serializers import ProjectSerializer, UpdateProjectSerializer, ProjectDetailSerializer, CreateProjectSerializer
+from api.serializers import ContributorSerializer, UpdateContributorSerializer, CreateContributorSerializer
+from api.serializers import IssueSerializer, UpdateIssueSerializer, CreateIssueSerializer
 from api.serializers import CommentSerializer, UpdateCommentSerializer, CreateCommentSerializer
 
 from django.shortcuts import render
@@ -32,29 +27,42 @@ def signup_page(request):
     return render(request, 'api/signup.html', context={'form': form})
 
 
+# -------------------------
+#   Projects related code
+# -------------------------
+
 @api_view(['GET', 'POST'])
-# @authentication_classes([SessionAuthentication, BasicAuthentication])
 @permission_classes([IsAuthenticated])
 def projects(request):
     """
     Work with the project list
     """
 
-    current_user = request.user
+    connected_user = request.user
 
-    # Get project list for the connected user (to be implemented)
+    # Get full project list
     if request.method == 'GET':
-        project_list = Project.objects.filter(author_user_id=current_user)
+        project_list = Project.objects.all()
         serializer = ProjectSerializer(project_list, many=True)
         return Response(serializer.data)
 
     # Create a project
     elif request.method == 'POST':
-        serializer = ProjectSerializer(data=request.data)
+        request.data.update({'author_user_id': connected_user.id})
+        serializer = CreateProjectSerializer(data=request.data)
+
         if serializer.is_valid():
-            serializer.save()
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            proj = serializer.save()
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        # Add a single contributor from now: the creator as manager
+        new_contrib = Contributor.objects.create(user_id=connected_user,
+                                                 project_id=proj,
+                                                 role="Project Manager",
+                                                 permission="Read-Write-Delete")
+
+        return Response(status=status.HTTP_201_CREATED)
 
 
 @api_view(['GET', 'PUT', 'DELETE'])
@@ -63,20 +71,53 @@ def projects_detail(request, project_id):
     """
     More actions on a particular project
     """
-    # Get more infos about a particular project
+
+    # Find project or quit immediately
+    try:
+        proj = Project.objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Are we contributor to this project?
+    connected_user = request.user
+    try:
+        contrib = Contributor.objects.get(user_id=connected_user, project_id=proj)
+    except Contributor.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Get detailed infos about a particular project
     if request.method == 'GET':
-        proj = Project.objects.filter(id=project_id)
-        serializer = ProjectDetailSerializer(proj, many=True)
+        serializer = ProjectDetailSerializer(proj)
         return Response(serializer.data)
 
     # Update project
     elif request.method == 'PUT':
-        pass
+        if proj.author_user_id == connected_user:
+            serializer = UpdateProjectSerializer(proj, data=request.data, partial=True)
 
-    # Delete project
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
+
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Delete project (available for its creator only)
     elif request.method == 'DELETE':
-        pass
+        if proj.author_user_id == connected_user:
+            proj.delete()
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
+    # Everything OK
+    return Response(status=status.HTTP_200_OK)
+
+
+# ----------------------
+#   Users related code
+# ----------------------
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
@@ -84,27 +125,123 @@ def users(request, project_id):
     """
     Manipulate users related to a project
     """
+
+    # Get project infos - if it exists
+    try:
+        proj = Project.objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Check if the connected user is a contributor - necessary for any further operation
+    connected_user = request.user
+    try:
+        contrib = Contributor.objects.get(user_id=connected_user, project_id=proj)
+    except Contributor.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
     # Get user list for this project
     if request.method == 'GET':
-        proj = Project.objects.get(id=project_id)
         contrib_list = Contributor.objects.filter(project_id=proj)
         serializer = ContributorSerializer(contrib_list, many=True)
         return Response(serializer.data)
 
     # Add user to a project
     elif request.method == 'POST':
-        pass
+        # In order to add a new user, we have to be the project creator
+        if proj.author_user_id != connected_user:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
+        # The "UniqueConstraint" in contributor model protects us against if a user is added twice
+        request.data.update({'project_id': project_id})
+        serializer = CreateContributorSerializer(data=request.data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(status=status.HTTP_200_OK)
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
 
-@api_view(['DELETE'])
+@api_view(['PUT', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def users_detail(request, project_id, user_id):
     """
-    Remove user from a project
+    Remove/Modify user
     """
-    # Remove user from project
-    if request.method == 'DELETE':
-        pass
+
+    # Get project infos - if it exists
+    try:
+        proj = Project.objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Check if the connected user has enough rights on this project (= created it)
+    connected_user = request.user
+    if proj.author_user_id != connected_user:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Find the user we want to update/remove
+    try:
+        user_obj = User.objects.get(id=user_id)
+    except User.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Find contributor entry in the table for this user
+    try:
+        contrib = Contributor.objects.get(user_id=user_obj, project_id=proj)
+    except Contributor.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    if request.method == 'PUT':
+        serializer = UpdateContributorSerializer(contrib, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    elif request.method == 'DELETE':
+        contrib.delete()
+        return Response(status=status.HTTP_200_OK)
+
+
+# -----------------------
+#   Issues related code
+# -----------------------
+
+def is_user_contributor(user_obj, project):
+    """
+    Check whether a user contributes to a given project
+    """
+
+    try:
+        contrib = Contributor.objects.get(user_id=user_obj, project_id=project)
+    except Contributor.DoesNotExist:
+        return False
+
+    # The user was found
+    return True
+
+
+def get_issue_infos(issue_id, connected_user):
+    """
+    Get contributor infos + issue
+    """
+
+    # Get corresponding issue
+    try:
+        issue = Issue.objects.get(id=issue_id)
+    except Issue.DoesNotExist:
+        raise ValueError(status.HTTP_400_BAD_REQUEST)
+
+    # Retrieve user rights as a contributor on this project
+    related_project = issue.project_id
+
+    try:
+        contrib = Contributor.objects.get(user_id=connected_user, project_id=related_project)
+    except Contributor.DoesNotExist:
+        raise ValueError(status.HTTP_400_BAD_REQUEST)
+
+    return related_project, issue, contrib
 
 
 @api_view(['GET', 'POST'])
@@ -113,6 +250,17 @@ def issues(request, project_id):
     """
     Manage issues related to a project
     """
+
+    connected_user = request.user
+    try:
+        proj = Project.objects.get(id=project_id)
+    except Project.DoesNotExist:
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
+    # Connected user needs to be a project contributor to access issues
+    if not is_user_contributor(connected_user, proj):
+        return Response(status=status.HTTP_400_BAD_REQUEST)
+
     # Get issues list for this project
     if request.method == 'GET':
         proj = Project.objects.get(id=project_id)
@@ -122,25 +270,19 @@ def issues(request, project_id):
 
     # Add an issue to a project
     elif request.method == 'POST':
-        try:
-            proj = Project.objects.get(id=project_id)
-        except Project.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+        request.data.update({'author_user_id': connected_user.id,
+                            'project_id': proj.id})
+        serializer = CreateIssueSerializer(data=request.data)
 
-        data = JSONParser().parse(request)
-        if 'desc' in data and 'title' in data and 'tag' in data and 'priority' in data and 'status' in data:
-            Issue.objects.create(author_user_id=User.objects.get(username='admin@oc.com'),
-                                 assignee_user_id=User.objects.get(username='admin@oc.com'),
-                                 project_id=proj,
-                                 desc=data['desc'],
-                                 title=data['title'],
-                                 tag=data['tag'],
-                                 priority=data['priority'],
-                                 status=data['status'])
+        # Check here if the user is not a contributor
+        if serializer.is_valid():
+            new_issue = serializer.save()
+            if not is_user_contributor(new_issue.assignee_user_id, proj):
+                new_issue.delete()
+                return Response(status=status.HTTP_400_BAD_REQUEST)
+            return Response(serializer.data, status=status.HTTP_200_OK)
         else:
-            return Response(status=status.HTTP_400_BAD_REQUEST)
-
-        return Response(status=status.HTTP_202_ACCEPTED)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['PUT', 'DELETE'])
@@ -149,58 +291,36 @@ def issues_detail(request, project_id, issue_id):
     """
     More actions related to a particular issue
     """
-    # Update issue
+
+    connected_user = request.user
+    try:
+        related_project, issue, contrib = get_issue_infos(issue_id, connected_user)
+    except ValueError as err:
+        return Response(status=err.args)
+
+    # Update issue - if it belongs to connected user
     if request.method == 'PUT':
-        data = JSONParser().parse(request)
-        try:
-            obj = Issue.objects.get(id=issue_id)
-        except Issue.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+        if issue.author_user_id == connected_user:
+            serializer = UpdateIssueSerializer(issue, data=request.data, partial=True)
+            if serializer.is_valid():
+                serializer.save()
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        # Keep current values as default before updating
-        update_fields = {
-            "desc": obj.desc,
-            "title": obj.title,
-            "tag": obj.tag,
-            "priority": obj.priority,
-            "status": obj.status
-        }
-
-        # Modify values found in POST payload
-        if 'desc' in data:
-            update_fields['desc'] = data['desc']
-
-        if 'title' in data:
-            update_fields['title'] = data['title']
-
-        if 'tag' in data:
-            update_fields['tag'] = data['tag']
-
-        if 'priority' in data:
-            update_fields['priority'] = data['priority']
-
-        if 'status' in data:
-            update_fields['status'] = data['status']
-
-        # Updating...
-        obj.desc = update_fields['desc']
-        obj.title = update_fields['title']
-        obj.tag = update_fields['tag']
-        obj.priority = update_fields['priority']
-        obj.status = update_fields['status']
-        obj.save()
-
-        return Response(status=status.HTTP_202_ACCEPTED)
-
-    # Delete issue
+    # Delete issue if we own it and
     elif request.method == 'DELETE':
-        try:
-            obj = Issue.objects.get(id=issue_id)
-            obj.delete()
+        if issue.author_user_id == connected_user:
+            issue.delete()
             return Response(status=status.HTTP_200_OK)
-        except Comment.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+        else:
+            return Response(status=status.HTTP_400_BAD_REQUEST)
 
+
+# -------------------------
+#   Comments related code
+# -------------------------
 
 @api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
@@ -209,21 +329,11 @@ def comments(request, project_id, issue_id):
     Comments-related actions
     """
 
-    # Get corresponding issue
-    try:
-        issue = Issue.objects.get(id=issue_id)
-    except Issue.DoesNotExist:
-        return Response(status=status.HTTP_404_NOT_FOUND)
-
-    # Check user rights as a contributor on this project
-    related_project = issue.project_id
     connected_user = request.user
     try:
-        contrib = Contributor.objects.get(user_id=connected_user, project_id=related_project)
-        # DEBUG
-        print(f"User Role: {contrib.role} - Permissions {contrib.permission}")
-    except Contributor.DoesNotExist:
-        return Response(status=status.HTTP_403_FORBIDDEN)
+        related_project, issue, contrib = get_issue_infos(issue_id, connected_user)
+    except ValueError as err:
+        return Response(status=err.args)
 
     # Retrieve list of comments related to a given problem
     if request.method == 'GET':
@@ -233,27 +343,21 @@ def comments(request, project_id, issue_id):
 
     # Create a comment
     elif request.method == 'POST':
-        # The user is indeed a contributor to this project, but does he have Read-only rights?
-        if contrib.permission == "Read":
-            return Response(status=status.HTTP_403_FORBIDDEN)
-        else:
-            # ICI: le type de code que nous souhaitons, et en dessous (commenté) celui que j'utilisais
-            serializer = CreateCommentSerializer(data=request.data,
-                                                 context={'author_user': connected_user, 'issue': issue})
-            if serializer.is_valid():
-                serializer.save()
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        # data = JSONParser().parse(request)
-        # if 'description' in data:
-        #     Comment.objects.create(author_user_id=connected_user,
-        #                            issue_id=issue,
-        #                            description=data['description'])
-        # else:
+        # Permissions could be used here, or to create an issue, but it does not necessarily correspond
+        # to the requirements -> leave it commented
+        # if contrib.permission == "Read":
         #     return Response(status=status.HTTP_400_BAD_REQUEST)
-        #
-        # return Response(status=status.HTTP_202_ACCEPTED)
+
+        # Create a new comment with default values
+        request.data.update({'author_user_id': connected_user.id,
+                             'issue_id': issue.id})
+        serializer = CreateCommentSerializer(data=request.data)
+
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        else:
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 @api_view(['PUT', 'DELETE', 'GET'])
@@ -263,15 +367,17 @@ def comments_detail(request, project_id, issue_id, comment_id):
     Detailed actions on a particular comment
     """
 
+    connected_user = request.user
+
     # Get comment (and check its owner)
     try:
-        comment = Comment.objects.get(id=comment_id, author_user_id=request.user)
+        comment = Comment.objects.get(id=comment_id, author_user_id=connected_user)
     except Comment.DoesNotExist:
-        return Response(status=status.HTTP_404_NOT_FOUND)
+        return Response(status=status.HTTP_400_BAD_REQUEST)
 
     # Update comment
     if request.method == 'PUT':
-        serializer = UpdateCommentSerializer(comment, data=request.data)
+        serializer = UpdateCommentSerializer(comment, data=request.data, partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data, status=status.HTTP_202_ACCEPTED)
@@ -286,23 +392,3 @@ def comments_detail(request, project_id, issue_id, comment_id):
     elif request.method == 'GET':
         serializer = CommentSerializer(comment)
         return Response(serializer.data, status=status.HTTP_200_OK)
-
-
-    # BACKUP
-
-    # Update comment
-    # if request.method == 'PUT':
-    #     data = JSONParser().parse(request)
-    #     try:
-    #         obj = Comment.objects.get(id=comment_id)
-    #     except Comment.DoesNotExist:
-    #         return Response(status=status.HTTP_404_NOT_FOUND)
-    #
-    #     if 'description' in data:
-    #         obj.description = data['description']
-    #         obj.save()
-    #     else:
-    #         return Response(status=status.HTTP_400_BAD_REQUEST)
-    #
-    #     return Response(status=status.HTTP_202_ACCEPTED)
-    #     # HTTP_201_CREATED / HTTP_400_BAD_REQUEST
