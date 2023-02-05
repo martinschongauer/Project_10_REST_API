@@ -53,8 +53,8 @@ class TestCategory(APITestCase):
 
     def test_projects_get(self):
         # Let's create a user for this test, and his first project
-        user, username, password = self.Create_User()
-        proj = self.Create_Project(user)
+        user, username, password = self.create_user()
+        proj = self.create_project(user)
 
         # Log in
         self.log_jwt(username, password)
@@ -75,7 +75,7 @@ class TestCategory(APITestCase):
 
     def test_projects_post_put_del(self):
         # Create a user and log in
-        user, username, password = self.Create_User()
+        user, username, password = self.create_user()
         self.log_jwt(username, password)
 
         # The project is, this time, created thanks to a POST
